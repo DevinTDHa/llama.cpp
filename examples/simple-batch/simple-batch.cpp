@@ -13,8 +13,17 @@ void fill_batch(llama_batch &batch, const std::vector<std::vector<llama_token>> 
 
 bool decode_batches(llama_context *ctx, llama_batch &batch, int32_t n_batch);
 
-
 bool generation_finished(const std::vector<int32_t> &i_batch);
+
+void sample_and_add(const int n_sequences, const int max_len, const llama_model *model, llama_context *ctx,
+                    std::vector<std::string> &generated_results, int n_cur, llama_batch &batch,
+                    std::vector<int32_t> &i_batch,
+                    int &n_decode);
+
+void sample_and_add_2(const int n_sequences, const int max_len, const llama_model *model, llama_context *ctx,
+                      std::vector<std::string> &generated_results, int n_cur, llama_batch &batch,
+                      std::vector<int32_t> &i_batch,
+                      int &n_decode, llama_sampling_context *ctx_sampling, llama_context *ctx_cfg);
 
 /** Tokenize the provided batch of prompts.
  *
@@ -117,10 +126,14 @@ bool decode_batches(llama_context *ctx, llama_batch &batch, int32_t n_batch) {
     return true;
 }
 
+bool generation_finished(const std::vector<int32_t> &i_batch) {
+    return std::all_of(i_batch.begin(), i_batch.end(),
+                       [](int i) { return i < 0; });
+}
 
 void sample_and_add(const int n_sequences, const int max_len, const llama_model *model, llama_context *ctx,
-                    std::vector<std::string> &generated_results, int n_cur, llama_batch &batch, std::vector<int32_t> &i_batch,
-                    int &n_decode) {
+                    std::vector<std::string> &generated_results, int n_cur, llama_batch &batch,
+                    std::vector<int32_t> &i_batch, int &n_decode) {
     for (int32_t i = 0; i < n_sequences; ++i) {
         if (i_batch[i] < 0) {
             // the stream has already finished
@@ -153,6 +166,40 @@ void sample_and_add(const int n_sequences, const int max_len, const llama_model 
 
         //const llama_token new_token_id = llama_sample_token_greedy(ctx, &candidates_p);
 
+        // is it an end of stream? -> mark the stream as finished TODO: n_cur should be dependent on the current generated sequence
+        if (new_token_id == llama_token_eos(model) || n_cur == max_len) {
+            i_batch[i] = -1;
+            LOG_TEE("\n");
+            if (n_sequences > 1) {
+                LOG_TEE("%s: stream %d finished at n_cur = %d", __func__, i, n_cur);
+            }
+
+            continue;
+        }
+
+        generated_results[i] += llama_token_to_piece(ctx, new_token_id);
+
+        i_batch[i] = batch.n_tokens;
+
+        // push this new token for next evaluation
+        llama_batch_add(batch, new_token_id, n_cur, {i}, true);
+
+        n_decode += 1;
+    }
+}
+
+void sample_and_add_2(const int n_sequences, const int max_len, const llama_model *model, llama_context *ctx,
+                      std::vector<std::string> &generated_results, int n_cur, llama_batch &batch,
+                      std::vector<int32_t> &i_batch, int &n_decode, llama_sampling_context *ctx_sampling,
+                      llama_context *ctx_cfg) {
+    for (int32_t i = 0; i < n_sequences; ++i) {
+        if (i_batch[i] < 0) {
+            // the stream has already finished
+            continue;
+        }
+
+        const llama_token new_token_id = llama_sampling_sample(ctx_sampling, ctx, ctx_cfg, i_batch[i]);
+
         // is it an end of stream? -> mark the stream as finished
         if (new_token_id == llama_token_eos(model) || n_cur == max_len) {
             i_batch[i] = -1;
@@ -174,6 +221,7 @@ void sample_and_add(const int n_sequences, const int max_len, const llama_model 
         n_decode += 1;
     }
 }
+
 
 int main(int argc, char **argv) {
     gpt_params params;
@@ -281,14 +329,28 @@ int main(int argc, char **argv) {
     // we need this to determine which logits to sample from
     // This needs to be adjusted for different batch lengths
     // It should contain the index of the last token of each sequence
-    std::vector<int32_t> i_batch(n_sequences, batch.n_tokens - 1);
-    std::transform(&batch_tokens.front(), &batch_tokens.back(), i_batch.begin(),
-                   [](std::vector<llama_token> &tokens) {
-                       return (int32_t) tokens.size();
+    std::vector<int32_t> i_batch(n_sequences, -1);
+    std::transform(batch_tokens.begin(), batch_tokens.end(), i_batch.begin(),
+                   [](const std::vector<llama_token> &tokens) {
+                       // TODO: This calculation needs to depend on how the batch was constructed and organized
+                       return (int32_t) tokens.size() - 1;
                    });
 
     int n_cur = batch.n_tokens;
     int n_decode = 0; // TODO: Might be not needed
+//
+//    // initialize the sampling context
+//    llama_sampling_params sampling_params = params.sparams;
+//    const int top_k = 40;
+//    const float top_p = 0.9f;
+//    const float temp = 0.4f;
+//
+//    sampling_params.top_k = top_k;
+//    sampling_params.top_p = top_p;
+//    sampling_params.temp = temp;
+//
+//    llama_sampling_context *ctx_sampling = llama_sampling_init(sampling_params);
+//    llama_context *ctx_cfg = nullptr; // Optional classifier-free guidance context
 
     const auto t_main_start = ggml_time_us();
 
@@ -300,7 +362,7 @@ int main(int argc, char **argv) {
         // sample the next token for each parallel sequence / stream
         sample_and_add(n_sequences, max_len, model, ctx, generated_results, n_cur, batch, i_batch, n_decode);
 
-        // all streams are finished
+        // all streams are finished, no new tokens were added
         if (batch.n_tokens == 0) {
             break;
         }
@@ -308,7 +370,7 @@ int main(int argc, char **argv) {
         n_cur += 1;
 
         // evaluate the current batch with the transformer model
-        if (llama_decode(ctx, batch)) {
+        if (decode_batches(ctx, batch, (int32_t) ctx_params.n_batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return 1;
         }
@@ -326,6 +388,14 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "\n");
 
+    // Print the generated results
+    for (int i = 0; i < n_sequences; i++) {
+        fprintf(stderr, "Generated sequence %d: %s\n", i, generated_results[i].c_str());
+    }
+
+    fprintf(stderr, "\n");
+
+
     llama_batch_free(batch);
 
     llama_free(ctx);
@@ -334,9 +404,4 @@ int main(int argc, char **argv) {
     llama_backend_free();
 
     return 0;
-}
-
-bool generation_finished(const std::vector<int32_t> &i_batch) {
-    return std::all_of(i_batch.begin(), i_batch.end(),
-                       [](int i) { return i < 0; });
 }
