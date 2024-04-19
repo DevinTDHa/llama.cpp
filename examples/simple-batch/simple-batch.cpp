@@ -19,10 +19,7 @@ void sample_and_add(int n_sequences, int max_len, const llama_model *model, llam
                     std::vector<std::string> &generated_results, std::vector<int> &n_cur, llama_batch &batch,
                     std::vector<int32_t> &i_batch, int &n_decode);
 
-//void sample_and_add_2(int n_sequences, int max_len, const llama_model *model, llama_context *ctx,
-//                      std::vector<std::string> &generated_results, int n_cur, llama_batch &batch,
-//                      std::vector<int32_t> &i_batch,
-//                      int &n_decode, llama_sampling_context *ctx_sampling, llama_context *ctx_cfg);
+int get_n_kv_req(int max_len, const std::vector<std::vector<llama_token>> &batch_tokens);
 
 /** Tokenize the provided batch of prompts.
  *
@@ -67,27 +64,6 @@ void fill_batch(llama_batch &batch, const std::vector<std::vector<llama_token>> 
         }
     }
 
-//     Find the maximum length of the sequences in the batch
-//    const size_t max_length = std::max_element(batch_tokens.begin(), batch_tokens.end(),
-//                                               [](const std::vector<llama_token> &a,
-//                                                  const std::vector<llama_token> &b) {
-//                                                   return a.size() < b.size();
-//                                               })->size();
-////     Fill batch, starting from the first token of each batch, iterating through the sequences first.
-////     This way, each batch of sequences is processed in parallel. See batched-bench.cpp for the initial approach.
-//    for (size_t i = 0; i < max_length; i++) {
-//        for (int b = 0; b < n_sequences; b++) {
-//            const unsigned long seq_length = batch_tokens[b].size();
-//            if (i < seq_length) {
-//                llama_batch_add(
-//                        batch,
-//                        batch_tokens[b][i],
-//                        static_cast<int32_t>(i), // TODO: Check for overflow?
-//                        {b},
-//                        i == seq_length - 1); // If last token, we need the logits
-//            }
-//        }
-//    }
 }
 
 
@@ -170,7 +146,7 @@ void sample_and_add(const int n_sequences, const int max_len, const llama_model 
             i_batch[i] = -1;
             LOG_TEE("\n");
             if (n_sequences > 1) {
-                LOG_TEE("%s: stream %d finished at n_cur[i] = %d", __func__, i, n_cur[i]);
+                LOG_TEE("%s: stream %d finished at n_cur[%d] = %d\n", __func__, i, i, n_cur[i]);
             }
 
             continue;
@@ -225,6 +201,17 @@ void sample_and_add(const int n_sequences, const int max_len, const llama_model 
 //        n_decode += 1;
 //    }
 //}
+
+
+int get_n_kv_req(const int max_len, const std::vector<std::vector<llama_token>> &batch_tokens) {
+    int n_kv_req = 0;
+
+    // calculate the required cache for each sequence in the batch
+    for (const auto &tokens_list: batch_tokens) {
+        n_kv_req += (int) (max_len - tokens_list.size());
+    }
+    return n_kv_req;
+}
 
 
 int main(int argc, char **argv) {
@@ -284,9 +271,7 @@ int main(int argc, char **argv) {
 
     const int n_ctx = (int) llama_n_ctx(ctx);
 
-    // TODO: Better calculation of this value, should be exactly calculated by the number of sequences in the batch
-    // TODO: and the maximum length of the generated sequences
-    const int n_kv_req = (int) ctx_params.n_batch * 2;
+    int n_kv_req = get_n_kv_req(max_len, batch_tokens);
 
     LOG_TEE("\n%s: n_len = %d, n_ctx = %d, n_kv_req = %d\n", __func__, max_len, n_ctx, n_kv_req);
 
@@ -316,8 +301,9 @@ int main(int argc, char **argv) {
 
     // create a llama_batch with size 512
     // we use this object to submit token data for decoding
-    int max_tokens = 512;
-    llama_batch batch = llama_batch_init(max_tokens, 0, (int) ctx_params.n_batch);
+    int max_tokens = (int) ctx_params.n_batch;
+    int max_sequences = (int) ctx_params.n_batch; // Max sequence batch size TODO: Which one?
+    llama_batch batch = llama_batch_init(max_tokens, 0, max_sequences);
     fill_batch(batch, batch_tokens);
 
     if (!decode_batches(ctx, batch, (int32_t) ctx_params.n_batch)) {
@@ -352,7 +338,7 @@ int main(int argc, char **argv) {
 
     // Keep track of indices of each sequence in the batch
     std::vector<int> n_cur = i_batch;
-    int n_decode = 0; // TODO: Might be not needed
+    int n_decode = 0; // Only For benchmarking
 //
 //    // initialize the sampling context
 //    llama_sampling_params sampling_params = params.sparams;
@@ -408,12 +394,10 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "\n");
 
-
+    // free resources
     llama_batch_free(batch);
-
     llama_free(ctx);
     llama_free_model(model);
-
     llama_backend_free();
 
     return 0;
