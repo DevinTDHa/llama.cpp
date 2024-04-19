@@ -17,7 +17,8 @@ bool generation_finished(const std::vector<int32_t> &i_batch);
 
 void sample_and_add(int n_sequences, int max_len, const llama_model *model, llama_context *ctx,
                     std::vector<std::string> &generated_results, std::vector<int> &n_cur, llama_batch &batch,
-                    std::vector<int32_t> &i_batch, int &n_decode);
+                    std::vector<int32_t> &i_batch, int &n_decode, llama_sampling_context *ctx_sampling,
+                    llama_context *ctx_cfg);
 
 int get_n_kv_req(int max_len, const std::vector<std::vector<llama_token>> &batch_tokens);
 
@@ -106,38 +107,34 @@ bool generation_finished(const std::vector<int32_t> &i_batch) {
                        [](int i) { return i < 0; });
 }
 
+/**
+ * This function is used to sample and add tokens to the batch for each sequence.
+ * It uses the sampling context to sample a new token for each sequence and adds it to the batch.
+ * If the end of the sequence is reached or the maximum length is exceeded, the sequence is marked as finished.
+ *
+ * @param n_sequences: The number of sequences to process.
+ * @param max_len: The maximum length of a sequence.
+ * @param model: Pointer to the llama model.
+ * @param ctx: Pointer to the main llama context.
+ * @param generated_results: Vector of strings where the generated results for each sequence are stored.
+ * @param n_cur: Vector of integers representing the current length of each sequence.
+ * @param batch: The batch where the new tokens are added.
+ * @param i_batch: Vector of integers representing the index in the batch for each sequence.
+ * @param n_decode: Reference to an integer representing the total number of decoded tokens.
+ * @param ctx_sampling: Pointer to the sampling context used for sampling new tokens.
+ * @param ctx_cfg: Pointer to the context used for classifier-free guidance.
+ */
 void sample_and_add(const int n_sequences, const int max_len, const llama_model *model, llama_context *ctx,
                     std::vector<std::string> &generated_results, std::vector<int> &n_cur, llama_batch &batch,
-                    std::vector<int32_t> &i_batch, int &n_decode) {
+                    std::vector<int32_t> &i_batch, int &n_decode, llama_sampling_context *ctx_sampling,
+                    llama_context *ctx_cfg = nullptr) {
     for (int32_t i = 0; i < n_sequences; ++i) {
         if (i_batch[i] < 0) {
             // the stream has already finished
             continue;
         }
 
-        auto n_vocab = llama_n_vocab(model);
-        // get the logits for the last token
-        auto *logits = llama_get_logits_ith(ctx, i_batch[i]);
-
-        std::vector<llama_token_data> candidates;
-        candidates.reserve(n_vocab);
-
-        // Assign logits from previous computation to each token candidate
-        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-            candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
-        }
-
-        llama_token_data_array candidates_p = {candidates.data(), candidates.size(), false};
-
-        const int top_k = 40;
-        const float top_p = 0.9f;
-        const float temp = 0.4f;
-
-        llama_sample_top_k(ctx, &candidates_p, top_k, 1);
-        llama_sample_top_p(ctx, &candidates_p, top_p, 1);
-        llama_sample_temp(ctx, &candidates_p, temp);
-
-        const llama_token new_token_id = llama_sample_token(ctx, &candidates_p);
+        const llama_token new_token_id = llama_sampling_sample(ctx_sampling, ctx, ctx_cfg, i_batch[i]);
 
         //const llama_token new_token_id = llama_sample_token_greedy(ctx, &candidates_p);
 
@@ -166,41 +163,6 @@ void sample_and_add(const int n_sequences, const int max_len, const llama_model 
         llama_batch_add(batch, new_token_id, n_cur[i], {i}, true);
     }
 }
-
-//// Uses sampling_sample instead
-//void sample_and_add_2(const int n_sequences, const int max_len, const llama_model *model, llama_context *ctx,
-//                      std::vector<std::string> &generated_results, int n_cur, llama_batch &batch,
-//                      std::vector<int32_t> &i_batch, int &n_decode, llama_sampling_context *ctx_sampling,
-//                      llama_context *ctx_cfg) {
-//    for (int32_t i = 0; i < n_sequences; ++i) {
-//        if (i_batch[i] < 0) {
-//            // the stream has already finished
-//            continue;
-//        }
-//
-//        const llama_token new_token_id = llama_sampling_sample(ctx_sampling, ctx, ctx_cfg, i_batch[i]);
-//
-//        // is it an end of stream? -> mark the stream as finished
-//        if (new_token_id == llama_token_eos(model) || n_cur == max_len) {
-//            i_batch[i] = -1;
-//            LOG_TEE("\n");
-//            if (n_sequences > 1) {
-//                LOG_TEE("%s: stream %d finished at n_cur = %d", __func__, i, n_cur);
-//            }
-//
-//            continue;
-//        }
-//
-//        generated_results[i] += llama_token_to_piece(ctx, new_token_id);
-//
-//        i_batch[i] = batch.n_tokens;
-//
-//        // push this new token for next evaluation
-//        llama_batch_add(batch, new_token_id, n_cur, {i}, true);
-//
-//        n_decode += 1;
-//    }
-//}
 
 
 int get_n_kv_req(const int max_len, const std::vector<std::vector<llama_token>> &batch_tokens) {
@@ -339,19 +301,19 @@ int main(int argc, char **argv) {
     // Keep track of indices of each sequence in the batch
     std::vector<int> n_cur = i_batch;
     int n_decode = 0; // Only For benchmarking
-//
-//    // initialize the sampling context
-//    llama_sampling_params sampling_params = params.sparams;
-//    const int top_k = 40;
-//    const float top_p = 0.9f;
-//    const float temp = 0.4f;
-//
-//    sampling_params.top_k = top_k;
-//    sampling_params.top_p = top_p;
-//    sampling_params.temp = temp;
-//
-//    llama_sampling_context *ctx_sampling = llama_sampling_init(sampling_params);
-//    llama_context *ctx_cfg = nullptr; // Optional classifier-free guidance context
+
+    // initialize the sampling context
+    llama_sampling_params sampling_params = params.sparams;
+    const int top_k = 40;
+    const float top_p = 0.9f;
+    const float temp = 0.4f;
+
+    sampling_params.top_k = top_k;
+    sampling_params.top_p = top_p;
+    sampling_params.temp = temp;
+
+    llama_sampling_context *ctx_sampling = llama_sampling_init(sampling_params);
+    llama_context *ctx_cfg = nullptr; // Optional classifier-free guidance context
 
     const auto t_main_start = ggml_time_us();
 
@@ -361,7 +323,8 @@ int main(int argc, char **argv) {
         llama_batch_clear(batch);
 
         // sample the next token for each parallel sequence / stream
-        sample_and_add(n_sequences, max_len, model, ctx, generated_results, n_cur, batch, i_batch, n_decode);
+        sample_and_add(n_sequences, max_len, model, ctx, generated_results, n_cur, batch, i_batch, n_decode,
+                       ctx_sampling, ctx_cfg);
 
         // all streams are finished, no new tokens were added
         if (batch.n_tokens == 0) {
